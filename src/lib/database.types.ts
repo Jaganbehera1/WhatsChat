@@ -15,7 +15,7 @@ export interface Database {
           content: string | null;
           created_at: string;
           id: string;
-          media_type: string | null;
+          media_type: "image" | "video" | null;
           media_url: string | null;
           sender_id: string;
         };
@@ -24,7 +24,7 @@ export interface Database {
           content?: string | null;
           created_at?: string;
           id?: string;
-          media_type?: string | null;
+          media_type?: "image" | "video" | null;
           media_url?: string | null;
           sender_id: string;
         };
@@ -33,7 +33,7 @@ export interface Database {
           content?: string | null;
           created_at?: string;
           id?: string;
-          media_type?: string | null;
+          media_type?: "image" | "video" | null;
           media_url?: string | null;
           sender_id?: string;
         };
@@ -95,6 +95,7 @@ export interface Database {
           email: string;
           id: string;
           is_online: boolean;
+          last_heartbeat: string | null;
           last_seen: string | null;
           mobile_number: string;
           name: string;
@@ -104,8 +105,9 @@ export interface Database {
         Insert: {
           created_at?: string;
           email: string;
-          id: string;
+          id?: string;
           is_online?: boolean;
+          last_heartbeat?: string | null;
           last_seen?: string | null;
           mobile_number: string;
           name: string;
@@ -117,6 +119,7 @@ export interface Database {
           email?: string;
           id?: string;
           is_online?: boolean;
+          last_heartbeat?: string | null;
           last_seen?: string | null;
           mobile_number?: string;
           name?: string;

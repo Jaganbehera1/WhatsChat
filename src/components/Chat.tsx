@@ -91,6 +91,17 @@ export const Chat = ({ chatId, otherUser: initialOtherUser, onBack }: ChatProps)
   const messageMenuRef = useRef<HTMLDivElement>(null);
   const mountedRef = useRef(true);
   
+  // Online status tracking with minimized state detection
+  const onlineStatusRef = useRef({
+    isOnline: false,
+    lastHeartbeat: 0,
+    tabCount: 0,
+    heartbeatInterval: null as NodeJS.Timeout | null,
+    lastVisibilityChange: Date.now(),
+    isMinimized: false,
+    minimizeTimeout: null as NodeJS.Timeout | null
+  });
+
   // Profile Picture Modal State
   const [profilePictureModal, setProfilePictureModal] = useState<{ 
     isOpen: boolean; 
@@ -146,18 +157,240 @@ export const Chat = ({ chatId, otherUser: initialOtherUser, onBack }: ChatProps)
     return date.toLocaleDateString();
   };
 
-  // Update my online status in the profiles table
-  const setMyOnline = useCallback(async (online: boolean) => {
+  // ========== ENHANCED ONLINE STATUS SYSTEM ==========
+
+  // Update online status in database
+  const updateOnlineStatus = useCallback(async (isOnline: boolean) => {
     if (!profile?.id) return;
+    
     try {
-      await supabase
+      const updateData = {
+        is_online: isOnline,
+        last_seen: isOnline ? null : new Date().toISOString(),
+        last_heartbeat: isOnline ? new Date().toISOString() : null
+      };
+
+      const { error } = await supabase
         .from('profiles')
-        .update({ is_online: online, last_seen: online ? null : new Date().toISOString() })
+        .update(updateData)
         .eq('id', profile.id);
+
+      if (error) {
+        console.error('Error updating online status:', error);
+      } else {
+        console.log(`✅ Status updated: ${isOnline ? 'Online' : 'Offline'}`);
+        onlineStatusRef.current.isOnline = isOnline;
+      }
     } catch (err) {
-      console.error('Error updating my online status:', err);
+      console.error('Error updating online status:', err);
     }
   }, [profile?.id]);
+
+  // Enhanced heartbeat system with reconnection and status verification
+  const startHeartbeat = useCallback(() => {
+    if (onlineStatusRef.current.heartbeatInterval) {
+      clearInterval(onlineStatusRef.current.heartbeatInterval);
+    }
+
+    // Initial heartbeat
+    const sendHeartbeat = async (isInitial = false) => {
+      if (!profile?.id || (!isInitial && !onlineStatusRef.current.isOnline)) return;
+
+      try {
+        // First verify we're actually online
+        const { data: currentStatus } = await supabase
+          .from('profiles')
+          .select('is_online, last_heartbeat')
+          .eq('id', profile.id)
+          .single();
+
+        // If we think we're online but database says offline, sync up
+        if (onlineStatusRef.current.isOnline && currentStatus && !currentStatus.is_online) {
+          console.log('🔄 Detected offline state in DB, re-establishing online status');
+          await updateOnlineStatus(true);
+        }
+
+        // Send heartbeat
+        await supabase
+          .from('profiles')
+          .update({ 
+            last_heartbeat: new Date().toISOString(),
+            is_online: true
+          })
+          .eq('id', profile.id);
+        
+        onlineStatusRef.current.lastHeartbeat = Date.now();
+        console.log('💓 Heartbeat sent', isInitial ? '(initial)' : '');
+
+      } catch (err) {
+        console.error('Error in heartbeat:', err);
+        // If this was the initial heartbeat, try to go offline
+        if (isInitial) {
+          try {
+            await updateOnlineStatus(false);
+          } catch (offlineErr) {
+            console.error('Error going offline:', offlineErr);
+          }
+        }
+      }
+    };
+
+    // Send initial heartbeat
+    sendHeartbeat(true);
+
+    // Set up periodic heartbeat
+    onlineStatusRef.current.heartbeatInterval = setInterval(async () => {
+      await sendHeartbeat();
+      
+      // Check if we've been minimized too long
+      if (onlineStatusRef.current.isMinimized && 
+          Date.now() - onlineStatusRef.current.lastVisibilityChange >= 30000) {
+        console.log('⏰ Been minimized for over 30 seconds, going offline');
+        await updateOnlineStatus(false);
+      }
+    }, 20000); // Every 20 seconds
+
+  }, [profile?.id, updateOnlineStatus]);
+
+  // Check if user should be marked offline (no heartbeat for 30+ seconds)
+  const checkHeartbeatStatus = useCallback(async () => {
+    if (!profile?.id) return;
+
+    try {
+      const { data } = await supabase
+        .from('profiles')
+        .select('last_heartbeat, is_online')
+        .eq('id', profile.id)
+        .single();
+
+      if (data && data.last_heartbeat) {
+        const lastHeartbeat = new Date(data.last_heartbeat).getTime();
+        const now = Date.now();
+        const timeSinceLastHeartbeat = now - lastHeartbeat;
+
+        // If no heartbeat for 35 seconds, mark as offline
+        if (timeSinceLastHeartbeat > 35000 && data.is_online) {
+          console.log('🔄 Auto-marking offline due to missing heartbeat');
+          await updateOnlineStatus(false);
+        }
+      }
+    } catch (err) {
+      console.error('Error checking heartbeat status:', err);
+    }
+  }, [profile?.id, updateOnlineStatus]);
+
+  // Multi-tab coordination using localStorage
+  const setupMultiTabCoordination = useCallback(() => {
+    const tabId = Math.random().toString(36).substr(2, 9);
+    
+    // Update tab count when this tab starts
+    const updateTabCount = (increment: boolean) => {
+      try {
+        const tabs = JSON.parse(localStorage.getItem('active_tabs') || '{}');
+        
+        if (increment) {
+          tabs[tabId] = Date.now();
+        } else {
+          delete tabs[tabId];
+        }
+        
+        localStorage.setItem('active_tabs', JSON.stringify(tabs));
+        onlineStatusRef.current.tabCount = Object.keys(tabs).length;
+        
+        console.log(`📑 Active tabs: ${onlineStatusRef.current.tabCount}`);
+        
+        // If this is the first tab, mark online
+        if (increment && onlineStatusRef.current.tabCount === 1) {
+          updateOnlineStatus(true);
+          startHeartbeat();
+        }
+        // If this was the last tab, mark offline
+        else if (!increment && onlineStatusRef.current.tabCount === 0) {
+          updateOnlineStatus(false);
+          if (onlineStatusRef.current.heartbeatInterval) {
+            clearInterval(onlineStatusRef.current.heartbeatInterval);
+          }
+        }
+      } catch (err) {
+        console.error('Error updating tab count:', err);
+      }
+    };
+
+    // Listen for storage events from other tabs
+    const handleStorageChange = (e: StorageEvent) => {
+      if (e.key === 'active_tabs' && e.newValue) {
+        try {
+          const tabs = JSON.parse(e.newValue);
+          onlineStatusRef.current.tabCount = Object.keys(tabs).length;
+          console.log(`📑 Tab count updated: ${onlineStatusRef.current.tabCount}`);
+        } catch (err) {
+          console.error('Error parsing tab count:', err);
+        }
+      }
+    };
+
+    // Initialize
+    updateTabCount(true);
+    window.addEventListener('storage', handleStorageChange);
+
+    // Cleanup
+    return () => {
+      updateTabCount(false);
+      window.removeEventListener('storage', handleStorageChange);
+    };
+  }, [updateOnlineStatus, startHeartbeat]);
+
+  // Enhanced user status polling with heartbeat check
+  const setupUserStatusPolling = useCallback(() => {
+    const pollUserStatus = async () => {
+      if (!mountedRef.current || !initialOtherUser.id) return;
+      
+      try {
+        const { data: userData, error } = await supabase
+          .from('profiles')
+          .select<'*', Profile>('*')
+          .eq('id', initialOtherUser.id)
+          .single();
+
+        if (!error && userData && mountedRef.current) {
+          setOtherUser(prev => {
+            // Only update if something actually changed
+            if (prev.is_online === userData.is_online && prev.last_seen === userData.last_seen) {
+              return prev;
+            }
+            
+            console.log('🟢 User status update:', {
+              name: userData.name,
+              is_online: userData.is_online,
+              last_seen: userData.last_seen
+            });
+            
+            return {
+              ...prev,
+              is_online: userData.is_online,
+              last_seen: userData.last_seen
+            };
+          });
+        }
+      } catch (error) {
+        console.error('Error in user status polling:', error);
+      }
+    };
+
+    // Poll immediately and then every 25 seconds
+    pollUserStatus();
+    const interval = setInterval(pollUserStatus, 25000);
+    return () => clearInterval(interval);
+  }, [initialOtherUser.id]);
+
+  // Check own heartbeat status periodically
+  const setupHeartbeatMonitor = useCallback(() => {
+    const interval = setInterval(() => {
+      checkHeartbeatStatus();
+    }, 30000); // Check every 30 seconds
+    
+    return () => clearInterval(interval);
+  }, [checkHeartbeatStatus]);
 
   // Handle profile picture click
   const handleProfilePictureClick = () => {
@@ -264,7 +497,6 @@ export const Chat = ({ chatId, otherUser: initialOtherUser, onBack }: ChatProps)
     },
     [profile?.id, saveUnreadMessages]
   );
-
 
   // Fetch recent chats with last messages and unread counts - FIXED VERSION
   const fetchRecentChats = useCallback(async () => {
@@ -499,13 +731,9 @@ export const Chat = ({ chatId, otherUser: initialOtherUser, onBack }: ChatProps)
           } catch (err) {
             console.error('Error tracking presence on channel:', err);
           }
-          // Also update profiles table to mark user online
-          setMyOnline(true);
         } else {
           setConnectionStatus('disconnected');
           console.log('❌ Real-time disconnected:', status);
-          // best-effort mark offline
-          setMyOnline(false);
         }
       });
 
@@ -515,58 +743,10 @@ export const Chat = ({ chatId, otherUser: initialOtherUser, onBack }: ChatProps)
       console.error('❌ Error setting up real-time:', error);
       setConnectionStatus('disconnected');
     }
-  }, [chatId, profile?.id, incrementUnreadCount, initialOtherUser.id, setMyOnline]);
+  }, [chatId, profile?.id, incrementUnreadCount, initialOtherUser.id]);
 
-  // Enhanced user status polling - FIXED VERSION
-  const setupUserStatusPolling = useCallback(() => {
-    const pollUserStatus = async () => {
-      if (!mountedRef.current || !initialOtherUser.id) return;
-      
-      try {
-        const { data: userData, error } = await supabase
-          .from('profiles')
-          .select<'*', Profile>('*')
-          .eq('id', initialOtherUser.id)
-          .single();
+  // ========== ENHANCED EFFECTS FOR ONLINE STATUS ==========
 
-        if (!error && userData && mountedRef.current) {
-          setOtherUser(prev => {
-            // Only update if something actually changed
-            if (prev.is_online === userData.is_online && prev.last_seen === userData.last_seen) {
-              return prev;
-            }
-            
-            // Only log when there's an actual change
-            console.log('🟢 User status update:', {
-              name: userData.name,
-              is_online: userData.is_online,
-              last_seen: userData.last_seen
-            });
-            
-            return {
-              ...prev,
-              is_online: userData.is_online,
-              last_seen: userData.last_seen
-            };
-          });
-        }
-      } catch (error) {
-        console.error('Error in user status polling:', error);
-      }
-    };
-
-    // Poll immediately and then every 30 seconds (reduced frequency)
-    pollUserStatus();
-    const interval = setInterval(pollUserStatus, 30000);
-    return () => clearInterval(interval);
-  }, [initialOtherUser.id]);
-
-  // Initialize unread messages on component mount
-  useEffect(() => {
-    setUnreadMessages(loadUnreadMessages());
-  }, [loadUnreadMessages]);
-
-  // Effects
   useEffect(() => {
     mountedRef.current = true;
     let reconnectTimeout: NodeJS.Timeout;
@@ -593,46 +773,141 @@ export const Chat = ({ chatId, otherUser: initialOtherUser, onBack }: ChatProps)
 
     initializeChat();
     const statusInterval = setupUserStatusPolling();
+    const heartbeatMonitor = setupHeartbeatMonitor();
+    const multiTabCleanup = setupMultiTabCoordination();
 
     return () => {
+      // Clear mounted flag first to prevent any new operations
       mountedRef.current = false;
+
+      // Clear websocket subscription
       if (messagesChannelRef.current) {
         messagesChannelRef.current.unsubscribe();
       }
-      clearInterval(statusInterval);
-      if (reconnectTimeout) clearTimeout(reconnectTimeout);
-    };
-  }, [fetchInitialData, setupRealtimeSubscription, setupUserStatusPolling]);
 
-  // Keep profile is_online accurate via visibility/unload events
+      // Clear all intervals and timeouts
+      clearInterval(statusInterval);
+      if (heartbeatMonitor) clearInterval(heartbeatMonitor);
+      if (reconnectTimeout) clearTimeout(reconnectTimeout);
+      if (onlineStatusRef.current.heartbeatInterval) {
+        clearInterval(onlineStatusRef.current.heartbeatInterval);
+      }
+      if (onlineStatusRef.current.minimizeTimeout) {
+        clearTimeout(onlineStatusRef.current.minimizeTimeout);
+      }
+
+      // Mark user as offline if this was the last tab
+      const cleanupAndGoOffline = async () => {
+        try {
+          // Call the cleanup for multi-tab coordination
+          multiTabCleanup();
+
+          // If this was the last tab, mark user as offline
+          const tabs = JSON.parse(localStorage.getItem('active_tabs') || '{}');
+          const activeTabs = Object.keys(tabs).length;
+          
+          if (activeTabs === 0 && profile?.id) {
+            await supabase
+              .from('profiles')
+              .update({
+                is_online: false,
+                last_seen: new Date().toISOString(),
+                last_heartbeat: null
+              })
+              .eq('id', profile.id);
+            
+            console.log('👋 User went offline (last tab closed)');
+          }
+        } catch (err) {
+          console.error('Error during cleanup:', err);
+        }
+      };
+
+      // Execute cleanup
+      cleanupAndGoOffline();
+    };
+  }, [fetchInitialData, setupRealtimeSubscription, setupUserStatusPolling, setupHeartbeatMonitor, setupMultiTabCoordination]);
+
+  // Enhanced visibility and unload handlers
   useEffect(() => {
     if (!profile?.id) return;
 
-    // Mark online on mount
-    setMyOnline(true);
-
-    const handleVisibility = () => {
-      if (document.visibilityState === 'hidden') {
-        setMyOnline(false);
+    const handleVisibilityChange = () => {
+      if (document.visibilityState === 'visible') {
+        // Clear any pending minimize timeout
+        if (onlineStatusRef.current.minimizeTimeout) {
+          clearTimeout(onlineStatusRef.current.minimizeTimeout);
+          onlineStatusRef.current.minimizeTimeout = null;
+        }
+        
+        // Tab became visible - mark online if we have active tabs
+        if (onlineStatusRef.current.tabCount > 0) {
+          onlineStatusRef.current.isMinimized = false;
+          onlineStatusRef.current.lastVisibilityChange = Date.now();
+          updateOnlineStatus(true);
+          startHeartbeat();
+        }
       } else {
-        setMyOnline(true);
+        // Tab became hidden - start minimize timeout
+        onlineStatusRef.current.lastVisibilityChange = Date.now();
+        
+        // Clear any existing timeout
+        if (onlineStatusRef.current.minimizeTimeout) {
+          clearTimeout(onlineStatusRef.current.minimizeTimeout);
+        }
+        
+        // Set new timeout for 30 seconds
+        onlineStatusRef.current.minimizeTimeout = setTimeout(() => {
+          onlineStatusRef.current.isMinimized = true;
+          if (Date.now() - onlineStatusRef.current.lastVisibilityChange >= 30000) {
+            updateOnlineStatus(false);
+          }
+        }, 30000);
+        
+        console.log('📱 Tab hidden, will mark as offline in 30 seconds if still minimized');
       }
     };
 
     const handleBeforeUnload = () => {
-      // best-effort; don't await
-      setMyOnline(false);
+      // Clean up this tab's presence
+      try {
+        const tabs = JSON.parse(localStorage.getItem('active_tabs') || '{}');
+        Object.keys(tabs).forEach(tabKey => {
+          if (tabs[tabKey] && Date.now() - tabs[tabKey] > 60000) {
+            delete tabs[tabKey]; // Clean up old tabs
+          }
+        });
+        localStorage.setItem('active_tabs', JSON.stringify(tabs));
+      } catch (err) {
+        console.error('Error cleaning up tabs:', err);
+      }
     };
 
-    document.addEventListener('visibilitychange', handleVisibility);
+    const handleWindowFocus = () => {
+      // Window gained focus - ensure we're marked online
+      if (onlineStatusRef.current.tabCount > 0 && !onlineStatusRef.current.isOnline) {
+        updateOnlineStatus(true);
+        startHeartbeat();
+      }
+    };
+
+    const handleWindowBlur = () => {
+      // Window lost focus - continue heartbeat but don't change status
+      console.log('🔍 Window blurred, maintaining status');
+    };
+
+    document.addEventListener('visibilitychange', handleVisibilityChange);
     window.addEventListener('beforeunload', handleBeforeUnload);
+    window.addEventListener('focus', handleWindowFocus);
+    window.addEventListener('blur', handleWindowBlur);
 
     return () => {
-      setMyOnline(false);
-      document.removeEventListener('visibilitychange', handleVisibility);
+      document.removeEventListener('visibilitychange', handleVisibilityChange);
       window.removeEventListener('beforeunload', handleBeforeUnload);
+      window.removeEventListener('focus', handleWindowFocus);
+      window.removeEventListener('blur', handleWindowBlur);
     };
-  }, [profile?.id, setMyOnline]);
+  }, [profile?.id, updateOnlineStatus, startHeartbeat]);
 
   // Auto-scroll to bottom
   useEffect(() => {
@@ -748,6 +1023,11 @@ export const Chat = ({ chatId, otherUser: initialOtherUser, onBack }: ChatProps)
       setSelectedChats([]);
     }
   }, [shareModal.isOpen, fetchRecentChats]);
+
+  // Initialize unread messages on component mount
+  useEffect(() => {
+    setUnreadMessages(loadUnreadMessages());
+  }, [loadUnreadMessages]);
 
   // Check if buckets exist with better error handling
   const checkBucketExists = async (bucketName: string): Promise<boolean> => {
@@ -1016,7 +1296,6 @@ export const Chat = ({ chatId, otherUser: initialOtherUser, onBack }: ChatProps)
     }
   };
 
-
   // Handle message menu
   const handleMessageMenu = (messageId: string, isOwnMessage: boolean, event: React.MouseEvent) => {
     event.preventDefault();
@@ -1273,7 +1552,6 @@ export const Chat = ({ chatId, otherUser: initialOtherUser, onBack }: ChatProps)
         style={{
           left: messageMenu.position.x,
           top: messageMenu.position.y,
-          // Remove transform to use exact coordinates
         }}
       >
         <button
@@ -1289,22 +1567,22 @@ export const Chat = ({ chatId, otherUser: initialOtherUser, onBack }: ChatProps)
           <Share className="w-4 h-4" />
           Forward
         </button>
-        {messageMenu.isOwnMessage && (
-          <button
-            onClick={() => {
-              setDeleteModal({
-                isOpen: true,
-                messageId: messageMenu.messageId,
-                isOwnMessage: messageMenu.isOwnMessage
-              });
-              setMessageMenu(null);
-            }}
-            className="w-full px-4 py-2 text-left text-sm text-red-600 hover:bg-red-50 flex items-center gap-2"
-          >
-            <Trash2 className="w-4 h-4" />
-            Delete
-          </button>
-        )}
+        {/* Always show Delete in the menu. For incoming messages this will act as "Delete for me" (isOwnMessage=false).
+            For own messages it will surface the same Delete action and the DeleteModal will show "Delete for Everyone" option. */}
+        <button
+          onClick={() => {
+            setDeleteModal({
+              isOpen: true,
+              messageId: messageMenu.messageId,
+              isOwnMessage: messageMenu.isOwnMessage
+            });
+            setMessageMenu(null);
+          }}
+          className={`w-full px-4 py-2 text-left text-sm flex items-center gap-2 ${messageMenu.isOwnMessage ? 'text-red-600 hover:bg-red-50' : 'text-gray-700 hover:bg-gray-50'}`}
+        >
+          <Trash2 className="w-4 h-4" />
+          Delete
+        </button>
       </div>
     );
   };
@@ -1609,14 +1887,14 @@ export const Chat = ({ chatId, otherUser: initialOtherUser, onBack }: ChatProps)
                   {formatLastSeen(otherUser.last_seen, otherUser.is_online)}
                 </p>
                 <div 
-                  className={`w-2 h-2 rounded-full ${
-                    connectionStatus === 'connected' ? 'bg-green-400' :
-                    connectionStatus === 'connecting' ? 'bg-yellow-400' : 'bg-red-400'
-                  }`}
+                  // className={`w-2 h-2 rounded-full ${
+                  //   connectionStatus === 'connected' ? 'bg-green-400' :
+                  //   connectionStatus === 'connecting' ? 'bg-yellow-400' : 'bg-red-400'
+                  // }`}
                   title={`Real-time: ${connectionStatus}`}
                 />
                 <span className="text-xs text-teal-200">
-                  {connectionStatus === 'connected' ? 'Live' : 
+                  {connectionStatus === 'connected' ? '' : 
                   connectionStatus === 'connecting' ? 'Connecting...' : 'Offline'}
                 </span>
               </div>
